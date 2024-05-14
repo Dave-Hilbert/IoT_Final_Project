@@ -1,75 +1,137 @@
-"""
-Real-Time prediction
-Retrieve streaming data from the consumer and predict the number 
-of people inside the room. Utilize Flask, a simple REST API server, 
-as the endpoint for data feeding.
-"""
+from flask import Flask, render_template
+from influxdb_client import InfluxDBClient
+from sklearn.linear_model import LinearRegression
+import numpy as np
+import time
+from threading import Thread
 
-# Importing relevant modules
-import joblib
-import pandas as pd
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
-import os
-from influxdb_client import InfluxDBClient, Point
-from influxdb_client.client.write_api import ASYNCHRONOUS
-import json
-
-# Load the trained model
-knn_model = joblib.load('knn_model.pkl')
-model_columns = joblib.load("knn_model_columns.pkl")
-
-# Load environment variables from ".env"
-load_dotenv()
-
-# InfluxDB config
-BUCKET = os.environ.get('INFLUXDB_BUCKET')
-print("connecting to",os.environ.get('INFLUXDB_URL'))
-client = InfluxDBClient(
-    url=str(os.environ.get('INFLUXDB_URL')),
-    token=str(os.environ.get('INFLUXDB_TOKEN')),
-    org=os.environ.get('INFLUXDB_ORG')
-)
-write_api = client.write_api()
-
-# Create simple REST API server
+# Initialize Flask application
 app = Flask(__name__)
 
-# Default route: check if model is available.
-@app.route('/')
-def check_model():
-    if knn_model:
-        return "Model is ready for MWS prediction"
-    return "Server is running but something wrongs with the model"
+# Function to query temperature data from InfluxDB
 
-# Predict route: predict the output from streaming data
-@app.route('/predict', methods=['POST'])
-def predict():
-    try:
-        # Get JSON text from the request
-        json_text = request.data
-        # Convert JSON text to JSON object
-        json_data = json.loads(json_text)
-        # Add to dataframe
-        query = pd.DataFrame([json_data])
-        # Extract features and label from data
-        feature_sample = query[model_columns]
-        target_sample = query['Room_Occupancy_Count'][0]
-        # Predict the number of people inside the room
-        predict_sample = knn_model.predict(feature_sample)
-        print("Actual Room Occupancy Count", int(target_sample),"\tPredicted output:", int(predict_sample[0]))
-        # Assign the true label and predicted label into Point
-        point = Point("predict_value")\
-            .field("Actual_Occupancy_Count", target_sample)\
-            .field("Predicted_Occupancy_Count", predict_sample[0])
-        
-        # Write that Point into database
-        write_api.write(BUCKET, os.environ.get('INFLUXDB_ORG'), point)
-        return jsonify({"Actual Room Occupancy Count": int(target_sample), "Predicted output": int(predict_sample[0])}), 200
-    
-    except:
-        # Something error with data or model
-        return "Recheck the data", 400
-    
+
+def query_temperature():
+    # Connect to InfluxDB
+    influxdb_client = InfluxDBClient(url="https://iot-group7-service1.iotcloudserve.net",
+                                     token="muhb5tqVfkwuHd-0jKZ9SyoYBEkzSQGPMjPZCIGhLS8x5EFq-cUw5nq1kg4DTaRolCJbwV1Ap-K88EFQJK0_oA==", org="Chulalongkorn University")
+    query_api = influxdb_client.query_api()
+
+    # Define the query for temperature
+    query = '''from(bucket: "RaspberryPi")
+    |> range(start: -2h, stop: now())
+    |> filter(fn: (r) => r["_measurement"] == "sensor_data")
+    |> filter(fn: (r) => r["_field"] == "Temp")
+    |> aggregateWindow(every: 5s, fn: mean, createEmpty: false)
+    |> yield(name: "mean")'''
+
+    # Execute the query
+    result = query_api.query(org="Chulalongkorn University", query=query)
+
+    # Extract temperature values
+    temperature_data = []
+    for table in result:
+        for record in table.records:
+            value = record.get_value()
+            temperature_data.append(value)
+
+    return temperature_data
+
+# Function to train a simple linear regression model using all but the last data point
+
+
+def train_linear_regression(temperature_data):
+    # Convert to numpy arrays
+    temperature_data = np.array(temperature_data).reshape(-1, 1)
+
+    # Split data into features (X) and target (y)
+    X = temperature_data[:-1]  # All but the last temperature value
+    # All but the first temperature value (shifted by one)
+    y = temperature_data[1:]
+
+    # Training the model
+    model = LinearRegression()
+    model.fit(X, y)
+
+    return model
+
+# Prediction function to forecast one step ahead
+
+
+def predict_one_step_ahead(model, latest_temperature):
+    # Predict the temperature one step ahead
+    prediction = model.predict([[latest_temperature]])
+    return prediction[0][0]
+
+# Function to write the next temperature prediction to InfluxDB
+
+
+def write_prediction_to_influxdb(prediction):
+    # Connect to InfluxDB
+    influxdb_client = InfluxDBClient(url="https://iot-group7-service1.iotcloudserve.net",
+                                     token="muhb5tqVfkwuHd-0jKZ9SyoYBEkzSQGPMjPZCIGhLS8x5EFq-cUw5nq1kg4DTaRolCJbwV1Ap-K88EFQJK0_oA==", org="Chulalongkorn University")
+    write_api = influxdb_client.write_api()
+
+    # Define the point to write
+    point = {
+        "measurement": "predicted_temperature",
+        "fields": {
+            "value": prediction
+        }
+    }
+
+    # Write the point
+    write_api.write(bucket="RaspberryPi", record=point)
+
+
+def predict_and_publish():
+    while True:
+        try:
+            # Query temperature data
+            temperature_data = query_temperature()
+
+            # Train linear regression model
+            model = train_linear_regression(temperature_data)
+
+            # Get the latest temperature value
+            latest_temperature = temperature_data[-1]
+
+            # Predict one step ahead
+            next_temperature = predict_one_step_ahead(
+                model, latest_temperature)
+
+            # Write prediction to InfluxDB
+            write_prediction_to_influxdb(next_temperature)
+
+            print("Next temperature prediction:", next_temperature)
+
+            # Sleep for a certain interval before making the next prediction
+            time.sleep(4)  # Sleep for 60 seconds (adjust as needed)
+        except Exception as e:
+            print("An error occurred:", e)
+
+
+# Start a new thread to run the predict_and_publish function continuously
+prediction_thread = Thread(target=predict_and_publish)
+prediction_thread.daemon = True  # Terminate the thread when the main program exits
+prediction_thread.start()
+
+# Run the Flask application
 if __name__ == '__main__':
-    app.run()
+    # Query temperature data
+    temperature_data = query_temperature()
+
+    # Train linear regression model
+    model = train_linear_regression(temperature_data)
+
+    # Get the latest temperature value
+    latest_temperature = temperature_data[-1]
+
+    # Predict one step ahead
+    next_temperature = predict_one_step_ahead(model, latest_temperature)
+
+    # Write prediction to InfluxDB
+    write_prediction_to_influxdb(next_temperature)
+
+    print("Next temperature prediction:", next_temperature)
+    app.run(debug=True, port=5001)
